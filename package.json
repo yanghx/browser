@@ -1,0 +1,30 @@
+{
+  "name": "browser",
+  "version": "0.1.0",
+  "description": "Chrome MCP middleware - simplified browser automation for AI agents",
+  "type": "module",
+  "bin": {
+    "browser": "./dist/cli.js",
+    "browser-mcp": "./dist/index.js",
+    "browser-daemon": "./dist/daemon.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/cli.ts src/daemon.ts --format esm --dts",
+    "dev": "tsup src/index.ts src/cli.ts src/daemon.ts --format esm --watch",
+    "start": "node dist/index.js",
+    "cli": "node dist/cli.js",
+    "daemon": "node dist/daemon.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
