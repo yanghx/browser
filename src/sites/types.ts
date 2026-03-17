@@ -1,9 +1,6 @@
 /**
  * @params recipe metadata — parsed from /* @params { JSON } * / comment blocks
  * in .js recipe files.
- *
- * Each recipe is a standalone async function that runs inside a browser tab
- * via eval, using fetch() with the browser's cookies for authenticated API access.
  */
 
 export interface SiteMeta {
@@ -14,6 +11,8 @@ export interface SiteMeta {
   capabilities?: string[];
   readOnly?: boolean;
   example?: string;
+  runtime?: "node" | "browser"; // "node" = run directly in Node.js, "browser" = inject into Chrome (default)
+  auth?: "cookie" | "bearer+csrf" | "bearer+csrf+webpack"; // auth method (node runtime reads from auth.json)
   filePath: string;       // absolute path to .js file
   source: "local" | "community";
 }

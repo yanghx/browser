@@ -11,6 +11,9 @@ import { ensureDomainTab } from "../page-manager.js";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
+import { extractText } from "../formatters/json-cleaner.js";
+import { saveAuth, tierToAuth, DEFAULT_USER_AGENT, type AuthData } from "../auth/cookie-store.js";
+import { GUIDE_TEXT } from "../guide.js";
 
 const SITES_DIR = join(homedir(), ".md-browser", "sites");
 
@@ -47,7 +50,7 @@ const INSTALL_INTERCEPTOR = `
 (() => {
   window.__bb_captured = [];
   const MAX = 30;
-  const NOISE = /analytics|tracking|collect|pixel|telemetry|beacon|sentry|hotjar|gtag|gtm|doubleclick|googlesyndication|\.m3u8|\.mp4|\.m4s|\.mp3|\.jpg|\.png|\.gif|\.webp|\.svg|\.woff|\.css|\.js$|video\.twimg|pbs\.twimg|abs\.twimg|proxsee\.pscp|user_flow\.json|badge_count|subscription.*Product|hashflags|settings\.json|DataSaverMode|fleetline|PinnedTimelines|DmSettings|DirectCall|AltTextPrompt/i;
+  const NOISE = /analytics|tracking|collect|pixel|telemetry|beacon|sentry|hotjar|gtag|gtm|doubleclick|googlesyndication|\.m3u8|\.mp4|\.m4s|\.mp3|\.jpg|\.png|\.gif|\.webp|\.svg|\.woff|\.css|\.js$/i;
 
   // ── Patch fetch ──
   const origFetch = window.fetch;
@@ -224,7 +227,7 @@ export async function generateSiteCLI(
   const report = buildReport(uri, platform, captured, auth, cookies);
   const starter = generateRecipe(uri, platform, captured, auth, responseSchema);
 
-  // 10. Save
+  // 10. Save browser recipe
   const dir = outputDir || join(SITES_DIR, platform);
   await mkdir(dir, { recursive: true });
   const reportFile = join(dir, `_analysis_${actionName}.md`);
@@ -232,17 +235,75 @@ export async function generateSiteCLI(
   await writeFile(reportFile, report, "utf-8");
   await writeFile(starterFile, starter, "utf-8");
 
+  // 11. Extract full cookies from network requests and build auth.json
+  let authJsonSaved = false;
+  try {
+    const netResult = await ctx.chrome.callTool("list_network_requests", {});
+    const netText = extractText(netResult);
+
+    let reqId: number | null = null;
+    for (const line of netText.split("\n")) {
+      if (line.includes(hostname)) {
+        const m = line.match(/reqid=(\d+)/);
+        if (m) reqId = parseInt(m[1]);
+      }
+    }
+
+    let fullCookies = cookies; // fallback to document.cookie
+    let userAgent = "";
+    if (reqId != null) {
+      const detail = await ctx.chrome.callTool("get_network_request", { reqid: reqId });
+      const detailText = extractText(detail);
+      let inReqHeaders = false;
+      for (const line of detailText.split("\n")) {
+        if (line.includes("Request Headers")) { inReqHeaders = true; continue; }
+        if (line.includes("Response Headers") || line.includes("Response Body")) { inReqHeaders = false; continue; }
+        if (!inReqHeaders) continue;
+        const m = line.match(/^- ([^:]+):(.+)$/);
+        if (m) {
+          if (m[1].toLowerCase().trim() === "cookie") fullCookies = m[2].trim();
+          if (m[1].toLowerCase().trim() === "user-agent") userAgent = m[2].trim();
+        }
+      }
+    }
+
+    const authData: AuthData = {
+      tier: auth.tier,
+      domain: hostname,
+      cookies: fullCookies,
+      bearer: auth.bearerToken,
+      csrf: auth.csrfCookie && auth.csrfHeader
+        ? { header: auth.csrfHeader, cookie: auth.csrfCookie }
+        : undefined,
+      headers: auth.customHeaders,
+      userAgent: userAgent || DEFAULT_USER_AGENT,
+      updatedAt: new Date().toISOString(),
+    };
+
+    saveAuth(starterFile, authData);
+    authJsonSaved = true;
+
+    // 12. Generate node-runtime recipe by transforming the browser recipe
+    const nodeRecipe = browserToNodeRecipe(starter, auth, hostname);
+    const nodeFile = join(dir, `${actionName}.node.js`);
+    await writeFile(nodeFile, nodeRecipe, "utf-8");
+  } catch {
+    // auth.json / node recipe generation is best-effort
+  }
+
   return {
     success: true, action: "dev",
     data: {
       title: `API analysis for ${hostname}`,
       content: [
         `Analysis: ${reportFile}`,
-        `Starter recipe: ${starterFile}`,
+        `Browser recipe: ${starterFile}`,
+        authJsonSaved ? `Node recipe: ${join(dir, `${actionName}.node.js`)}` : "",
+        authJsonSaved ? `Auth: ${join(dir, "auth.json")}` : "",
         `Captured: ${captured.length} API requests`,
         "",
         report,
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       result: { reportFile, starterFile, auth, requestCount: captured.length },
     },
   };
@@ -283,12 +344,10 @@ function analyzeAuth(requests: CapturedRequest[], cookies: string): AuthAnalysis
         result.csrfHeader = key;
         result.tier = Math.max(result.tier, 2) as 1 | 2 | 3;
       }
-      if (lk === "x-twitter-auth-type" || lk === "x-client-transaction-id") {
-        result.customHeaders[key] = val;
-        if (lk === "x-client-transaction-id") {
-          result.needsWebpack = true;
-          result.tier = 3;
-        }
+      // Detect client-side signed headers (e.g. transaction IDs generated by bundled JS)
+      if (/transaction[._-]id|client[._-]signature|x-.*-hash/i.test(lk)) {
+        result.needsWebpack = true;
+        result.tier = 3;
       }
       // Collect auth-related x- headers (skip infra noise, skip csrf — handled separately)
       if (lk.startsWith("x-") && !lk.startsWith("x-requested") && !INFRA_HEADERS.test(lk)
@@ -322,7 +381,7 @@ function analyzeAuth(requests: CapturedRequest[], cookies: string): AuthAnalysis
   if (cookies) {
     const names = cookies.split(";").map((c) => c.trim().split("=")[0]);
     for (const name of names) {
-      if (/ct0|csrf|xsrf|session|token|auth|sid|jsessionid/i.test(name)) {
+      if (/csrf|xsrf|session|token|auth|sid|jsessionid/i.test(name)) {
         if (!result.cookies.includes(name)) result.cookies.push(name);
       }
     }
@@ -383,7 +442,7 @@ function buildReport(
 
     // Show auth-relevant request headers
     const interesting = Object.entries(req.requestHeaders).filter(([k]) =>
-      /authorization|csrf|token|x-twitter|x-client|content-type/i.test(k)
+      /authorization|csrf|xsrf|token|content-type/i.test(k) || k.toLowerCase().startsWith("x-")
     );
     if (interesting.length > 0) {
       lines.push(`Request headers:`);
@@ -424,6 +483,12 @@ function buildReport(
     lines.push("const resp = await fetch(url, {headers: _h, credentials: 'include'});");
     lines.push("```");
   }
+
+  // Append guide for AI reference
+  lines.push(``);
+  lines.push(`---`);
+  lines.push(``);
+  lines.push(GUIDE_TEXT);
 
   return lines.join("\n");
 }
@@ -506,17 +571,16 @@ function generateRecipe(
     if (auth.bearerToken) lines.push(`    'Authorization': 'Bearer ' + bearer,`);
     if (auth.csrfHeader && auth.csrfCookie) lines.push(`    '${escapeJS(auth.csrfHeader)}': ${csrfVar},`);
     for (const [k, v] of Object.entries(auth.customHeaders)) {
-      if (k.toLowerCase() === "x-client-transaction-id") continue;
+      // Skip client-side signed headers (dynamically generated, can't be hardcoded)
+      if (/transaction[._-]id|client[._-]signature|x-.*-hash/i.test(k)) continue;
       lines.push(`    '${escapeJS(k)}': '${escapeJS(v)}',`);
     }
     lines.push(`  };`);
     lines.push(``);
 
     if (auth.needsWebpack) {
-      lines.push(`  // Tier 3: webpack module injection for transaction ID`);
-      lines.push(`  // let __webpack_require__;`);
-      lines.push(`  // window.webpackChunk_XXX.push([['__bb_'+Date.now()],{},(r)=>{__webpack_require__=r}]);`);
-      lines.push(`  // _h['X-Client-Transaction-Id'] = await __webpack_require__(83914).jJ('${hostname}',path,'GET');`);
+      lines.push(`  // Tier 3: this site uses a client-side transaction ID generated by webpack modules.`);
+      lines.push(`  // You may need to extract the webpack module and call its signing function here.`);
       lines.push(``);
     }
 
@@ -565,8 +629,13 @@ function generateRecipe(
         lines.push(`  const url = '${basePath}?variables=' + encodeURIComponent(variables) + '&features=' + encodeURIComponent(features);`);
       }
     } else {
-      const sep = apiPath.includes("?") ? "&" : "?";
-      lines.push(`  const url = '${escapeJS(apiPath)}${sep}q=' + encodeURIComponent(args.query);`);
+      const hasQueryArg = inferredArgs.some((a) => a.name === "query");
+      if (hasQueryArg) {
+        const sep = apiPath.includes("?") ? "&" : "?";
+        lines.push(`  const url = '${escapeJS(apiPath)}${sep}q=' + encodeURIComponent(args.query);`);
+      } else {
+        lines.push(`  const url = '${escapeJS(apiPath)}';`);
+      }
     }
 
     lines.push(`  const resp = await fetch(url, {headers: _h, credentials: 'include'});`);
@@ -612,9 +681,9 @@ function escapeJS(s: string): string {
 // ─── Response Schema Analysis (runs in browser) ─────────────
 
 interface ResponseSchema {
-  arrayPath: string;        // JS path to the data array, e.g. "d.data.home.home_timeline_urt.instructions"
-  itemFields: string[];     // field extraction lines for each item
-  isTimeline: boolean;      // Twitter-style instructions[].entries[] pattern
+  arrayPath: string;        // JS path to the data array, e.g. "d.data.items"
+  fields?: Array<{ name: string; path: string; type: string; len: number }>;
+  itemCount?: number;
 }
 
 /**
@@ -655,87 +724,8 @@ async function analyzeResponseInBrowser(
       return null;
     }
 
-    // First, check for timeline pattern (instructions[].entries[]) — common in Twitter/X
-    // This takes priority over generic array detection
-    function findInstructions(obj, path, depth) {
-      if (depth > 6) return null;
-      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-        if (obj.instructions && Array.isArray(obj.instructions)) {
-          const instr = obj.instructions;
-          for (const inst of instr) {
-            if (inst.entries && Array.isArray(inst.entries) && inst.entries.length > 0) {
-              return { path: path + '.instructions', entries: inst.entries };
-            }
-          }
-        }
-        for (const [k, v] of Object.entries(obj)) {
-          const r = findInstructions(v, path + '.' + k, depth + 1);
-          if (r) return r;
-        }
-      }
-      return null;
-    }
-
-    const timeline = findInstructions(d, 'd', 0);
-    if (timeline) {
-      // Found timeline pattern — check for tweet_results
-      for (const entry of timeline.entries) {
-        const r = entry.content?.itemContent?.tweet_results?.result;
-        if (r) {
-          const tw = r.tweet || r;
-          return {
-            arrayPath: timeline.path,
-            isTimeline: true,
-            hasTweetResults: true,
-          };
-        }
-      }
-    }
-
     const arr = findArray(d, 'd', 0);
     if (!arr) return null;
-
-    const isTimeline = arr.path.includes('instructions');
-
-    // For timelines, find tweet fields from the first entry's tweet_results
-    if (isTimeline) {
-      const instructions = arr.items[0]?.entries ? [arr.items[0]] :
-        (function getInstr(o, p) {
-          if (Array.isArray(o)) return o;
-          if (o && typeof o === 'object') {
-            for (const v of Object.values(o)) { const r = getInstr(v); if (r) return r; }
-          }
-          return null;
-        })(d.data);
-
-      if (instructions) {
-        for (const inst of instructions) {
-          for (const entry of (inst.entries || [])) {
-            const r = entry.content?.itemContent?.tweet_results?.result;
-            if (r) {
-              const tw = r.tweet || r;
-              const l = tw.legacy || {};
-              const u = tw.core?.user_results?.result;
-              // Return the schema with confirmed fields
-              return {
-                arrayPath: arr.path,
-                isTimeline: true,
-                hasTweetResults: true,
-                sampleFields: {
-                  hasRestId: !!tw.rest_id,
-                  hasFullText: !!l.full_text,
-                  hasScreenName: !!u?.legacy?.screen_name,
-                  hasFavoriteCount: l.favorite_count !== undefined,
-                  hasRetweetCount: l.retweet_count !== undefined,
-                  hasCreatedAt: !!l.created_at,
-                  hasNoteTweet: !!tw.note_tweet,
-                },
-              };
-            }
-          }
-        }
-      }
-    }
 
     // Generic: extract field names from first item
     const sample = arr.items[0];
@@ -746,7 +736,7 @@ async function analyzeResponseInBrowser(
         const p = prefix ? prefix + '.' + k : k;
         if (v === null || v === undefined) continue;
         if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-          if (!/typename|cursor|clientEvent|controller|injection|entryType/i.test(k)) {
+          if (!/typename|cursor|clientEvent|controller|injection|entryType|__/i.test(k)) {
             fields.push({ name: k, path: p, type: typeof v, len: String(v).length });
           }
         } else if (typeof v === 'object' && !Array.isArray(v)) {
@@ -758,7 +748,6 @@ async function analyzeResponseInBrowser(
 
     return {
       arrayPath: arr.path,
-      isTimeline: false,
       itemCount: arr.items.length,
       fields: getFields(sample, '', 0).slice(0, 20),
     };
@@ -780,50 +769,19 @@ async function analyzeResponseInBrowser(
 /** Generate response parsing code from schema */
 function generateParser(schema: ResponseSchema | null): string[] {
   if (!schema) return [];
-  const lines: string[] = [];
 
-  if ((schema as any).isTimeline && (schema as any).hasTweetResults) {
-    // Twitter timeline pattern
-    const instrPath = schema.arrayPath.replace(/^d\./, "");
-    lines.push(`// Parse timeline`);
-    lines.push(`const instructions = d.${instrPath} || [];`);
-    lines.push(`let results = [], seen = new Set();`);
-    lines.push(`for (const inst of instructions) {`);
-    lines.push(`  for (const entry of (inst.entries || [])) {`);
-    lines.push(`    const r = entry.content?.itemContent?.tweet_results?.result;`);
-    lines.push(`    if (!r) continue;`);
-    lines.push(`    const tw = r.tweet || r;`);
-    lines.push(`    const l = tw.legacy || {};`);
-    lines.push(`    if (!tw.rest_id || seen.has(tw.rest_id)) continue;`);
-    lines.push(`    seen.add(tw.rest_id);`);
-    lines.push(`    const u = tw.core?.user_results?.result;`);
-    lines.push(`    const nt = tw.note_tweet?.note_tweet_results?.result?.text;`);
-    lines.push(`    results.push({`);
-    lines.push(`      id: tw.rest_id,`);
-    lines.push(`      author: u?.legacy?.screen_name,`);
-    lines.push(`      text: nt || l.full_text || '',`);
-    lines.push(`      url: 'https://x.com/' + (u?.legacy?.screen_name || '_') + '/status/' + tw.rest_id,`);
-    lines.push(`      likes: l.favorite_count, retweets: l.retweet_count,`);
-    lines.push(`      created_at: l.created_at,`);
-    lines.push(`    });`);
-    lines.push(`  }`);
-    lines.push(`}`);
-    lines.push(`return {count: results.length, results};`);
-    return lines;
-  }
-
-  // Generic array pattern
-  const fields: any[] = (schema as any).fields || [];
+  const fields = schema.fields || [];
   if (fields.length === 0) return [];
 
+  const lines: string[] = [];
   const arrayAccess = schema.arrayPath.replace(/^d\./, "");
   lines.push(`// Parse response`);
   lines.push(`const items = d.${arrayAccess} || [];`);
   lines.push(`const results = items.map(item => ({`);
 
-  // Pick useful fields
-  const useful = fields.filter((f: any) =>
-    /^(id|rest_id|name|title|text|full_text|description|url|href|screen_name|username|author|score|likes|count|created|published|date|status|slug)$/i.test(f.name)
+  // Pick useful fields by name pattern or reasonable string length
+  const useful = fields.filter((f) =>
+    /^(id|name|title|text|description|url|href|username|author|score|likes|count|created|published|date|status|slug|label|value|type|email|phone)$/i.test(f.name)
     || (f.type === "string" && f.len > 5 && f.len < 300)
   ).slice(0, 12);
 
@@ -859,7 +817,6 @@ function inferActionName(req: CapturedRequest | undefined): string {
   if (!req) return "example";
   try {
     const u = new URL(req.url);
-    // GraphQL: /i/api/graphql/abc123/OperationName → "home"
     const gqlMatch = u.pathname.match(/\/graphql\/[^/]+\/([^/?]+)/);
     if (gqlMatch) {
       return gqlMatch[1]
@@ -870,7 +827,6 @@ function inferActionName(req: CapturedRequest | undefined): string {
         // Remove "use_" prefix (React hook naming leaked into operation)
         .replace(/^use_/, "");
     }
-    // REST: /i/api/1.1/statuses/home_timeline.json → "home"
     const lastSeg = u.pathname.split("/").filter(Boolean).pop() || "example";
     return lastSeg.replace(/\.json$/, "").replace(/_timeline$/, "").toLowerCase();
   } catch {
@@ -898,18 +854,20 @@ function inferArgs(req: CapturedRequest | undefined): InferredArg[] {
         const vars = JSON.parse(raw);
         const args: InferredArg[] = [];
 
-        // Known user-facing variable patterns
-        if ("rawQuery" in vars || "query" in vars) {
-          args.push({ name: "query", required: true, description: "Search query" });
-        }
-        if ("screen_name" in vars) {
-          args.push({ name: "screen_name", required: true, description: "Username" });
-        }
-        if ("userId" in vars) {
-          args.push({ name: "user_id", required: true, description: "User ID" });
-        }
-        if ("focalTweetId" in vars) {
-          args.push({ name: "tweet_id", required: true, description: "Tweet ID" });
+        // Detect user-facing variable patterns by name
+        const patterns: Array<{ match: RegExp; name: string; desc: string }> = [
+          { match: /^(rawQuery|query|searchQuery|q)$/i, name: "query", desc: "Search query" },
+          { match: /^(screen_name|username|handle)$/i, name: "username", desc: "Username" },
+          { match: /^(userId|user_id|uid)$/i, name: "user_id", desc: "User ID" },
+          { match: /^(postId|itemId|id)$/i, name: "id", desc: "Item ID" },
+        ];
+        for (const p of patterns) {
+          for (const varName of Object.keys(vars)) {
+            if (p.match.test(varName)) {
+              args.push({ name: p.name, required: true, description: p.desc });
+              break;
+            }
+          }
         }
 
         return args;
@@ -934,17 +892,110 @@ function inferArgs(req: CapturedRequest | undefined): InferredArg[] {
 
 /** Check if a GraphQL variable name corresponds to an inferred arg */
 function variableMatchesArg(varName: string, argName: string): boolean {
-  // Direct match: count↔count, rawQuery↔query
   if (varName === argName) return true;
-  // rawQuery / query
-  if (varName === "rawQuery" && argName === "query") return true;
-  // screen_name
-  if (varName === "screen_name" && argName === "screen_name") return true;
-  // userId / user_id
-  if (varName === "userId" && argName === "user_id") return true;
-  // focalTweetId / tweet_id
-  if (varName === "focalTweetId" && argName === "tweet_id") return true;
+  // Normalize: camelCase → snake_case for comparison
+  const norm = (s: string) => s.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase();
+  if (norm(varName) === norm(argName)) return true;
+  // Common aliases
+  const aliases: Record<string, string[]> = {
+    query: ["rawQuery", "searchQuery", "q"],
+    username: ["screen_name", "handle"],
+    user_id: ["userId", "uid"],
+    id: ["postId", "itemId"],
+  };
+  for (const [arg, vars] of Object.entries(aliases)) {
+    if (argName === arg && vars.includes(varName)) return true;
+  }
   return false;
+}
+
+// ─── Node Recipe Generator ───────────────────────────────────
+
+/**
+ * Transform a browser recipe into a node recipe.
+ * Rewrites @params (add runtime/auth), function signature (add ctx),
+ * and replaces browser auth code with ctx.headers.
+ * The response parser is preserved exactly as-is.
+ */
+function browserToNodeRecipe(browserRecipe: string, auth: AuthAnalysis, hostname: string): string {
+  // ── Transform @params ──
+  let result = browserRecipe;
+
+  // Add .node to name
+  result = result.replace(
+    /("name"\s*:\s*"([^"]+)")/,
+    (_, full, name) => `"name": "${name}.node"`,
+  );
+
+  // Add runtime and auth before the closing }
+  const authLabel = tierToAuth(auth.tier);
+  result = result.replace(
+    /("example"\s*:\s*"[^"]*")\s*\n(\s*\})/,
+    `$1,\n  "runtime": "node",\n  "auth": ${JSON.stringify(authLabel)}\n$2`,
+  );
+
+  // Update example to use .node name (insert .node after action name, before args)
+  result = result.replace(
+    /("example"\s*:\s*"browser site )([^\s"]+)((?:\s[^"]*)?")/ ,
+    (_, pre, name, rest) => `${pre}${name}.node${rest}`,
+  );
+
+  // ── Transform function signature ──
+  result = result.replace(
+    /async function\s*\(\s*args\s*\)/,
+    "async function(args, ctx)",
+  );
+
+  // ── Remove browser-only auth code ──
+  // Remove: const csrf/ct0/bearer/... lines
+  // Remove: document.cookie extraction
+  // Remove: _h = { ... }; block
+  // Remove: Tier 3 webpack comments
+
+  // Remove lines: const VARNAME = document.cookie...
+  result = result.replace(/^[ \t]*const \w+ = document\.cookie.*\n/gm, "");
+  // Remove lines: if (!VARNAME) return {error: 'No ... cookie'...
+  result = result.replace(/^[ \t]*if \(!\w+\) return \{error: 'No \w+ cookie'.*\n/gm, "");
+  // Remove lines: const bearer = '...';
+  result = result.replace(/^[ \t]*const bearer = .*\n/gm, "");
+  // Remove _h = { ... }; block (match closing }; on its own line)
+  result = result.replace(/^[ \t]*const _h = \{[^}]*(?:\{[^}]*\}[^}]*)*\};\s*\n/gm, "");
+  // Remove Tier 3 webpack comment block
+  result = result.replace(/^[ \t]*\/\/ Tier 3:.*\n([ \t]*\/\/.*\n)*/gm, "");
+
+  // ── Replace fetch calls ──
+  // fetch('/path', {headers: _h, credentials: 'include'}) → fetch(ctx.baseUrl + '/path', {headers: ctx.headers})
+  result = result.replace(
+    /fetch\(\s*(['"])(\/[^'"]*)\1\s*,\s*\{[^}]*credentials:\s*'include'[^}]*\}/g,
+    (match, q, path) => `fetch(ctx.baseUrl + '${path}', {headers: ctx.headers}`,
+  );
+  // fetch(url, {headers: _h, credentials: 'include'}) → fetch(url, {headers: ctx.headers})
+  result = result.replace(
+    /fetch\(\s*url\s*,\s*\{[^}]*credentials:\s*'include'[^}]*\}/g,
+    "fetch(url, {headers: ctx.headers}",
+  );
+  // Remaining: {credentials: 'include'} → {headers: ctx.headers}
+  result = result.replace(
+    /\{credentials:\s*'include'\}/g,
+    "{headers: ctx.headers}",
+  );
+
+  // ── Fix relative URLs → ctx.baseUrl + ... ──
+  // fetch('/path' → fetch(ctx.baseUrl + '/path'
+  result = result.replace(
+    /fetch\(\s*(['"])(\/[^'"]*)\1/g,
+    (_, q, path) => `fetch(ctx.baseUrl + '${path}'`,
+  );
+  // const url = '/path... → const url = ctx.baseUrl + '/path...
+  result = result.replace(
+    /(\bconst url = )(['"])(\/)/g,
+    "$1ctx.baseUrl + $2$3",
+  );
+
+  // ── Clean up empty lines left by removals ──
+  result = result.replace(/\n{3,}/g, "\n\n");
+
+  return result;
 }
 
 /** Parse a GraphQL URL into base path + decoded variables/features/fieldToggles */

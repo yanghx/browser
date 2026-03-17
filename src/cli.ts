@@ -5,6 +5,7 @@ import { ChromeClient } from "./chrome-client.js";
 import { StateManager } from "./state.js";
 import { makeContext } from "./context.js";
 import { parseCommand } from "./command-parser.js";
+import { findSite } from "./sites/registry.js";
 import type {
   BrowserActionRequest,
   BrowserActionResponse,
@@ -14,6 +15,7 @@ import {
   deserializeTrace,
   type Trace,
 } from "./devtools/recorder.js";
+import { GUIDE_TEXT } from "./guide.js";
 import { generateTypeScript, generatePython } from "./devtools/codegen.js";
 
 // ANSI colors
@@ -300,6 +302,7 @@ ${col(c.bold, "Options:")}
   --no-color           Disable color output
   --direct             Bypass daemon, connect directly to Chrome MCP
   -h, --help           Show this help
+  guide                How to create site recipes (full tutorial)
 
 ${col(c.bold, "Daemon:")}
   daemon / start         Start background daemon (persistent Chrome connection)
@@ -321,6 +324,8 @@ ${col(c.bold, "Actions:")}
   state                           Page state summary
   tab list|new|select|close       Tab management
   site <site/action> [args...]    Site recipes (uses Chrome login)
+  auth save <domain>              Extract & save cookies from Chrome for node-runtime recipes
+  auth show <domain>              Show saved cookie keys
   cli <url> [--output dir]        Reverse-engineer site API → generate @params recipe
   trace start|stop|status         Record real user interactions in Chrome
   dev inspect|codegen|replay ...  Development tools
@@ -358,6 +363,19 @@ ${col(c.bold, "Gmail:")}
 `);
 }
 
+function printGuide() {
+  // Apply ANSI colors to the plain-text guide for terminal display
+  let text = GUIDE_TEXT;
+  text = text.replace(/^(\d+\. .+)$/gm, (_, s) => col(c.bold, s));
+  text = text.replace(/(Tier 1 — Cookie)/g, (_, s) => col(c.green, s));
+  text = text.replace(/(Tier 2 — Bearer \+ CSRF)/g, (_, s) => col(c.yellow, s));
+  text = text.replace(/(Tier 3 — Client-side signing)/g, (_, s) => col(c.red, s));
+  text = text.replace(/^(Files:)$/m, col(c.bold, "$1"));
+  text = text.replace(/^(   ---.*---)$/gm, (_, s) => col(c.dim, s));
+  text = text.replace(/^(   Rule:.*)$/gm, (_, s) => col(c.dim, s));
+  console.log(text);
+}
+
 // ─── Main ─────────────────────────────────────────────────────
 
 async function main() {
@@ -368,6 +386,11 @@ async function main() {
 
   if (allFlags.includes("--help") || allFlags.includes("-h") || args[0] === "help") {
     printHelp();
+    process.exit(0);
+  }
+
+  if (args[0] === "guide") {
+    printGuide();
     process.exit(0);
   }
 
@@ -433,28 +456,43 @@ async function main() {
     }
   }
 
+  // ── Parse command first to detect runtime:node recipes ──
+  const cleanArgs = process.argv.slice(2)
+    .filter((a) => a !== "--json" && a !== "--no-color" && a !== "--interactive" && a !== "-i" && a !== "--direct");
+  const input = cleanArgs.join(" ");
+
+  // Check if this is a runtime:node site recipe (skip Chrome connection)
+  let isNodeRuntime = false;
+  if (input && !allFlags.includes("-i") && !allFlags.includes("--interactive")) {
+    const preRequest = parseCommand(input);
+    if (preRequest?.action === "site" && preRequest.site && preRequest.siteAction) {
+      const recipe = findSite(`${preRequest.site}/${preRequest.siteAction}`);
+      if (recipe?.runtime === "node") isNodeRuntime = true;
+    }
+  }
+
   // ── Direct mode (no daemon) ──
   const cli = new BrowserCLI();
-  console.log(col(c.dim, "Connecting to Chrome DevTools MCP..."));
-  try {
-    await cli.connect();
-  } catch (err: any) {
-    console.error(col(c.red, `Failed to connect: ${err.message}`));
-    console.error(col(c.dim, "Make sure Chrome is running. Or start daemon: browser daemon"));
-    process.exit(1);
+
+  if (!isNodeRuntime) {
+    console.log(col(c.dim, "Connecting to Chrome DevTools MCP..."));
+    try {
+      await cli.connect();
+    } catch (err: any) {
+      console.error(col(c.red, `Failed to connect: ${err.message}`));
+      console.error(col(c.dim, "Make sure Chrome is running. Or start daemon: browser daemon"));
+      process.exit(1);
+    }
+    console.log(col(c.green, "Connected."));
   }
-  console.log(col(c.green, "Connected."));
 
   if (allFlags.includes("-i") || allFlags.includes("--interactive") || args.length === 0) {
+    // REPL always needs Chrome — already connected above (isNodeRuntime is always false here)
     await startRepl(cli);
     return;
   }
 
   // Single command (direct)
-  const cleanArgs = process.argv.slice(2)
-    .filter((a) => a !== "--json" && a !== "--no-color" && a !== "--interactive" && a !== "-i" && a !== "--direct");
-
-  const input = cleanArgs.join(" ");
   let request = parseCommand(input);
 
   if (request && cleanArgs.length > 1) {
@@ -473,11 +511,11 @@ async function main() {
   try {
     const response = await cli.execute(request);
     console.log(formatResponse(response));
-    await cli.disconnect();
+    if (!isNodeRuntime) await cli.disconnect();
     process.exit(response.success ? 0 : 1);
   } catch (err: any) {
     console.error(col(c.red, `Error: ${err.message}`));
-    await cli.disconnect();
+    if (!isNodeRuntime) await cli.disconnect();
     process.exit(1);
   }
 }

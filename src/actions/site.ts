@@ -1,13 +1,16 @@
 /**
- * Site action handler — eval-in-browser execution.
+ * Site action handler — supports two execution modes:
+ *
+ *   runtime: "browser" (default) — eval-in-browser via Chrome DevTools
+ *   runtime: "node"             — run directly in Node.js (no Chrome needed)
  *
  * Flow:
  *   1. Find recipe by name (e.g. "twitter/thread")
  *   2. Parse CLI args → argMap
- *   3. Find/create a tab matching the recipe's domain
- *   4. Read .js file, strip @params, construct: (jsBody)(argsJson)
- *   5. Eval in the browser tab via Chrome DevTools
- *   6. Parse result, handle {error} responses
+ *   3. Check runtime:
+ *      - "node"    → execute directly via AsyncFunction
+ *      - "browser" → find/create domain tab, eval via Chrome DevTools
+ *   4. Parse result, handle {error} responses
  */
 
 import type { ActionHandler } from "./types.js";
@@ -19,6 +22,7 @@ import {
 } from "../sites/registry.js";
 import { ensureDomainTab } from "../page-manager.js";
 import { extractText, extractJson } from "../formatters/json-cleaner.js";
+import { loadAuth, buildFetchHeaders, parseCookieMap } from "../auth/cookie-store.js";
 
 export const siteAction: ActionHandler = async (request, ctx) => {
   const { site, siteAction: actionName, args: siteArgs } = request;
@@ -33,8 +37,8 @@ export const siteAction: ActionHandler = async (request, ctx) => {
         data: {
           content:
             "No site recipes found.\n" +
-            "  Install community recipes: clone bb-sites into ~/.md-browser/bb-sites/\n" +
-            "  Private recipes: ~/.md-browser/sites/<platform>/<action>.js",
+            "  Recipes: ~/.md-browser/sites/<platform>/<action>.js\n" +
+            "  Generate: browser cli <url>",
         },
       };
     }
@@ -86,30 +90,70 @@ export const siteAction: ActionHandler = async (request, ctx) => {
     }
   }
 
-  // ── Ensure one tab per domain ──
-  if (recipe.domain) {
+  // ── Read recipe body ──
+  const jsBody = readRecipeBody(recipe);
+  const argsJson = JSON.stringify(argMap);
+
+  // ── Determine runtime: "node" runs JS in Node.js instead of Chrome ──
+  const useNode = recipe.runtime === "node";
+
+  let parsed: any;
+
+  if (useNode) {
+    // ── Node.js execution — read auth from auth.json, no Chrome needed ──
+    const auth = loadAuth(recipe.filePath);
+    if (recipe.domain && !auth) {
+      return {
+        success: false,
+        action: "site",
+        error: `No auth.json for ${recipe.domain}. Run: auth save ${recipe.domain}`,
+      };
+    }
+
+    const cookies = auth?.cookies || "";
+    const nodeCtx = {
+      cookies,
+      cookieMap: parseCookieMap(cookies),
+      domain: recipe.domain,
+      baseUrl: recipe.domain ? `https://${recipe.domain}` : "",
+      bearer: auth?.bearer || "",
+      csrf: auth?.csrf ? parseCookieMap(cookies)[auth.csrf.cookie] || "" : "",
+      headers: auth ? buildFetchHeaders(auth) : {},
+      auth,
+    };
+
     try {
-      await ensureDomainTab(ctx.chrome, ctx.state, recipe.domain);
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      const fn = new AsyncFunction("args", "ctx", `return await (${jsBody})(args, ctx)`);
+      const result = await fn(argMap, nodeCtx);
+      parsed = result;
     } catch (err: any) {
       return {
         success: false,
         action: "site",
-        error: `Failed to open tab for ${recipe.domain}: ${err.message}`,
+        error: `Recipe eval failed (node): ${err.message || String(err)}`,
       };
     }
-  }
-
-  // ── Build and eval script ──
-  const jsBody = readRecipeBody(recipe);
-  const argsJson = JSON.stringify(argMap);
-
-  try {
-    // Ensure snapshot exists (required by Chrome MCP before evaluate_script)
-    if (!ctx.state.getCachedSnapshot()) {
-      await ctx.chrome.callTool("take_snapshot", {});
+  } else {
+    // ── Browser execution via Chrome DevTools ──
+    if (recipe.domain) {
+      try {
+        await ensureDomainTab(ctx.chrome, ctx.state, recipe.domain);
+      } catch (err: any) {
+        return {
+          success: false,
+          action: "site",
+          error: `Failed to open tab for ${recipe.domain}: ${err.message}`,
+        };
+      }
     }
 
-    const wrapper = `async () => {
+    try {
+      if (!ctx.state.getCachedSnapshot()) {
+        await ctx.chrome.callTool("take_snapshot", {});
+      }
+
+      const wrapper = `async () => {
   try {
     const __result = await (${jsBody})(${argsJson});
     return __result;
@@ -118,45 +162,46 @@ export const siteAction: ActionHandler = async (request, ctx) => {
   }
 }`;
 
-    const result = await ctx.chrome.callTool("evaluate_script", {
-      function: wrapper,
-    });
+      const result = await ctx.chrome.callTool("evaluate_script", {
+        function: wrapper,
+      });
 
-    const text = extractText(result);
-    let parsed: any = extractJson(text) ?? text;
-
-    // Handle recipe-level {error} responses
-    if (parsed && typeof parsed === "object" && "error" in parsed && !("count" in parsed)) {
-      const errObj = parsed as { error: string; hint?: string };
-      const isAuthError =
-        /401|403|unauthorized|forbidden|not.?logged|login.?required|sign.?in|auth|ct0/i.test(
-          `${errObj.error} ${errObj.hint || ""}`,
-        );
-      const hint = isAuthError && recipe.domain
-        ? `Please log in to https://${recipe.domain} in your browser first, then retry.`
-        : errObj.hint;
+      const text = extractText(result);
+      parsed = extractJson(text) ?? text;
+    } catch (err: any) {
       return {
         success: false,
         action: "site",
-        error: `${errObj.error}${hint ? `\n  Hint: ${hint}` : ""}`,
+        error: `Recipe eval failed: ${err.message || String(err)}`,
       };
     }
+  }
 
-    return {
-      success: true,
-      action: "site",
-      data: {
-        title: recipe.name,
-        content: typeof parsed === "string" ? parsed : JSON.stringify(parsed, null, 2),
-        result: parsed,
-      },
-    };
-  } catch (err: any) {
+  // ── Handle recipe-level {error} responses ──
+  if (parsed && typeof parsed === "object" && "error" in parsed && !("count" in parsed)) {
+    const errObj = parsed as { error: string; hint?: string };
+    const isAuthError =
+      /401|403|unauthorized|forbidden|not.?logged|login.?required|sign.?in|auth|ct0/i.test(
+        `${errObj.error} ${errObj.hint || ""}`,
+      );
+    const hint = isAuthError && recipe.domain
+      ? `Please log in to https://${recipe.domain} in your browser first, then retry.`
+      : errObj.hint;
     return {
       success: false,
       action: "site",
-      error: `Recipe eval failed: ${err.message || String(err)}`,
+      error: `${errObj.error}${hint ? `\n  Hint: ${hint}` : ""}`,
     };
   }
+
+  return {
+    success: true,
+    action: "site",
+    data: {
+      title: recipe.name,
+      content: typeof parsed === "string" ? parsed : JSON.stringify(parsed, null, 2),
+      result: parsed,
+    },
+  };
 };
 

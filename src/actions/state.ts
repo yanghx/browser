@@ -25,7 +25,12 @@ export const stateAction: ActionHandler = async (_request, ctx) => {
 
     const consoleText = extractText(consoleResult);
     const consoleData = extractJson(consoleText);
-    const errorCount = Array.isArray(consoleData) ? consoleData.length : 0;
+    // list_console_messages may return text lines instead of JSON array
+    const errorCount = Array.isArray(consoleData)
+      ? consoleData.length
+      : consoleData == null
+        ? consoleText.split("\n").filter((l) => l.trim()).length
+        : 0;
 
     const summary = [
       `Links: ${pageInfo.links || 0}`,

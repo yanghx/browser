@@ -47,6 +47,8 @@ function parseSiteMeta(
         capabilities: json.capabilities,
         readOnly: json.readOnly,
         example: json.example,
+        runtime: json.runtime === "node" ? "node" : undefined,
+        auth: /^(cookie|bearer\+csrf(\+webpack)?)$/.test(json.auth || "") ? json.auth : undefined,
         filePath,
         source,
       };

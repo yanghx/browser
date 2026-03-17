@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ensureDaemon, sendCommand } from "./daemon-client.js";
+import { GUIDE_TEXT } from "./guide.js";
 
 export async function registerTools(server: McpServer) {
   // Ensure daemon is running before registering tools
@@ -41,24 +42,16 @@ Site recipes (eval-in-browser, uses Chrome login via fetch API):
   site github/repo <owner/repo>   Get repo info
   site <platform/action> [args]   Run any @params recipe from ~/.md-browser/
 
-Shopee (use when user mentions Shopee, shopping on Shopee, Shopee products):
-  site shopee/search <keyword>    Search Shopee products by keyword (--limit N)
-  site shopee/detail <url>        Get product details, price, specs, reviews
-  site shopee/cart                View Shopee shopping cart contents
-  site shopee/add-to-cart <url>   Add product to cart (--model N --quantity N)
-  site shopee/checkout            Preview checkout (--confirm yes to place order)
-
-Gmail (use when user mentions Gmail, email, inbox, send email):
-
 Recording:
   trace start|stop|status         Record real user interactions in Chrome
   dev codegen <file>              Generate TS/Python from recorded trace
   dev replay <file>               Replay a saved trace
 
 Dev tools:
-  dev cli <url>                   Reverse-engineer site API → generate @params recipe
   dev inspect <selector>          Inspect elements by CSS selector
-  dev network-log                 Capture XHR/fetch for API discovery`;
+  dev network-log                 Capture XHR/fetch for API discovery
+
+`+ GUIDE_TEXT;
 
   server.tool(
     "browser",

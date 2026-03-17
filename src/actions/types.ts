@@ -15,6 +15,8 @@ export const ACTION_TYPES = [
   "site",
   // Dev/debug
   "dev",
+  // Auth
+  "auth",
 ] as const;
 
 export type ActionType = (typeof ACTION_TYPES)[number];

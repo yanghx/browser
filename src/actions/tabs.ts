@@ -1,22 +1,20 @@
 import type { ActionHandler } from "./types.js";
-import { extractText, extractJson } from "../formatters/json-cleaner.js";
+import { parsePagesText } from "../page-manager.js";
+import { extractText } from "../formatters/json-cleaner.js";
 
 export const tabListAction: ActionHandler = async (_request, ctx) => {
   try {
     const result = await ctx.chrome.callTool("list_pages", {});
-    const text = extractText(result);
-
-    const parsed = extractJson(text);
-    const tabs: any[] = Array.isArray(parsed) ? parsed : parsed?.pages || [];
+    const tabs = parsePagesText(extractText(result));
 
     return {
       success: true,
       action: "tab_list",
       data: {
-        tabs: tabs.map((t: any) => ({
-          id: t.id ?? t.pageId ?? 0,
-          title: t.title || "",
-          url: t.url || "",
+        tabs: tabs.map((t) => ({
+          id: t.id,
+          title: t.title,
+          url: t.url,
         })),
         content: `${tabs.length} tabs open`,
       },

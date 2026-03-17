@@ -19,6 +19,15 @@ export function parseCommand(input: string): BrowserActionRequest | null {
 
   const actionStr = parts[0];
 
+  // "auth save/show <domain>"
+  if (actionStr === "auth") {
+    return {
+      action: "auth" as ActionType,
+      site: parts[1],        // "save" or "show"
+      siteAction: parts[2],  // domain, e.g. "x.com"
+    };
+  }
+
   // "cli <url>" → "dev cli <url>"
   if (actionStr === "cli") {
     return {
@@ -55,7 +64,7 @@ export function parseCommand(input: string): BrowserActionRequest | null {
     "press", "scroll", "select", "snapshot", "screenshot", "search",
     "state", "wait", "extract", "eval", "network",
     "tab_list", "tab_new", "tab_select", "close",
-    "site", "dev", "cli", "help", "tab",
+    "site", "dev", "cli", "help", "tab", "auth",
   ]);
   if (!knownActions.has(actionStr)) {
     const platform = siteAliases[actionStr] || actionStr;

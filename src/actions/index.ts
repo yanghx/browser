@@ -18,6 +18,7 @@ import { backAction, forwardAction, waitAction, closeAction } from "./navigation
 import { tabListAction, tabNewAction, tabSelectAction } from "./tabs.js";
 import { siteAction } from "./site.js";
 import { devAction } from "./dev.js";
+import { authAction } from "./auth.js";
 
 export const actionHandlers: Record<ActionType, ActionHandler> = {
   browse: browseAction,
@@ -44,4 +45,5 @@ export const actionHandlers: Record<ActionType, ActionHandler> = {
   tab_select: tabSelectAction,
   site: siteAction,
   dev: devAction,
+  auth: authAction,
 };

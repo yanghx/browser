@@ -1,37 +1,40 @@
 import type { ActionContext, BrowserActionResponse } from "../actions/types.js";
-import { extractText, extractJson } from "../formatters/json-cleaner.js";
+import { extractText } from "../formatters/json-cleaner.js";
 
 /**
  * Capture and format network requests for API discovery.
- * Shows URL patterns, request/response shapes for building agent CLIs.
+ * Shows URL patterns, request/response shapes for building site recipes.
  */
 export async function captureNetworkLog(
-  resourceTypes: string[] | undefined,
+  _resourceTypes: string[] | undefined,
   urlPattern: string | undefined,
   ctx: ActionContext
 ): Promise<BrowserActionResponse> {
-  const types = resourceTypes || ["xhr", "fetch"];
-
-  // Include preserved requests to capture requests from before this DevTools session attached
-  const result = await ctx.chrome.callTool("list_network_requests", {
-    resourceTypes: types,
-    includePreservedRequests: true,
-  });
-
+  const result = await ctx.chrome.callTool("list_network_requests", {});
   const text = extractText(result);
-  const parsed = extractJson(text);
-  let requests: any[] = Array.isArray(parsed) ? parsed : parsed?.networkRequests || parsed?.requests || [];
 
-  // If still empty, try without resource type filter (some Chrome MCP versions ignore the filter)
-  if (requests.length === 0) {
-    const fallback = await ctx.chrome.callTool("list_network_requests", {
-      includePreservedRequests: true,
+  // Parse Chrome DevTools MCP text format: "reqid=N METHOD URL [STATUS]"
+  const requests: Array<{
+    reqid: number;
+    method: string;
+    url: string;
+    status: number;
+  }> = [];
+
+  for (const line of text.split("\n")) {
+    const m = line.match(/reqid=(\d+)\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\S+)\s+\[(\d+|pending)\]/i);
+    if (!m) continue;
+    requests.push({
+      reqid: parseInt(m[1]),
+      method: m[2].toUpperCase(),
+      url: m[3],
+      status: m[4] === "pending" ? 0 : parseInt(m[4]),
     });
-    const fbText = extractText(fallback);
-    const fbParsed = extractJson(fbText);
-    const allReqs: any[] = Array.isArray(fbParsed) ? fbParsed : fbParsed?.networkRequests || fbParsed?.requests || [];
-    requests = allReqs.filter((r: any) => types.includes(r.resourceType || r.type || ""));
   }
+
+  // Filter: skip static assets and non-http URLs, keep API calls
+  const SKIP = /\.(js|css|jpg|jpeg|png|gif|webp|svg|woff2?|ttf|ico|m3u8|mp4|m4s)(\?|$)|^(blob:|data:)/i;
+  let filtered = requests.filter((r) => !SKIP.test(r.url));
 
   // Apply URL pattern filter
   if (urlPattern) {
@@ -45,57 +48,57 @@ export async function captureNetworkLog(
         error: `Invalid URL pattern regex: "${urlPattern}"`,
       };
     }
-    requests = requests.filter((r: any) => re.test(r.url || ""));
+    filtered = filtered.filter((r) => re.test(r.url));
   }
 
   // Group by URL pattern for API discovery
-  const apiPatterns = new Map<string, any[]>();
-  for (const req of requests) {
+  const apiPatterns = new Map<string, typeof filtered>();
+  for (const req of filtered) {
     let pattern: string;
     try {
-      const url = new URL(req.url || "", "http://localhost");
+      const url = new URL(req.url);
       pattern = url.pathname
         .replace(/\/\d+/g, "/:id")
         .replace(/\/[a-f0-9-]{20,}/g, "/:uuid");
     } catch {
-      pattern = req.url || "(unknown)";
+      pattern = req.url;
     }
 
-    if (!apiPatterns.has(pattern)) {
-      apiPatterns.set(pattern, []);
-    }
+    if (!apiPatterns.has(pattern)) apiPatterns.set(pattern, []);
     apiPatterns.get(pattern)!.push(req);
   }
 
   const lines: string[] = [
-    `Network Log (${requests.length} requests, types: ${types.join(", ")})`,
+    `Network Log (${filtered.length} API requests out of ${requests.length} total)`,
     "",
   ];
 
   // Detailed request list
   lines.push("## Requests\n");
-  for (const req of requests.slice(0, 30)) {
-    const status =
-      req.status >= 400
-        ? `[${req.status}]`
-        : `[${req.status || "..."}]`;
-    const method = (req.method || "GET").padEnd(6);
-    const url = req.url?.substring(0, 100) || "";
-    const size = req.responseSize || req.size
-      ? ` (${formatBytes(req.responseSize || req.size || 0)})`
-      : "";
-    const duration = req.duration ? ` ${req.duration}ms` : "";
-
-    lines.push(`  ${method} ${status} ${url}${size}${duration}`);
+  for (const req of filtered.slice(0, 50)) {
+    const status = req.status === 0 ? "[pending]" : `[${req.status}]`;
+    const method = req.method.padEnd(6);
+    const url = req.url.length > 120 ? req.url.substring(0, 120) + "..." : req.url;
+    lines.push(`  ${method} ${status} ${url}`);
+  }
+  if (filtered.length > 50) {
+    lines.push(`  ... and ${filtered.length - 50} more`);
   }
 
   // API pattern summary
   if (apiPatterns.size > 0) {
     lines.push("\n## API Patterns\n");
     for (const [pattern, reqs] of apiPatterns) {
-      const methods = [...new Set(reqs.map((r: any) => r.method || "GET"))];
+      const methods = [...new Set(reqs.map((r) => r.method))];
       lines.push(`  ${methods.join("/")} ${pattern} (${reqs.length} calls)`);
     }
+  }
+
+  if (filtered.length === 0) {
+    lines.push("\nNo API requests found. Try:");
+    lines.push("  1. Navigate to a page first: browser browse <url>");
+    lines.push("  2. Interact with the page (scroll, search, click)");
+    lines.push("  3. Re-run: browser dev network-log");
   }
 
   return {
@@ -103,20 +106,14 @@ export async function captureNetworkLog(
     action: "dev",
     data: {
       content: lines.join("\n"),
-      requests: requests.slice(0, 50).map((r: any) => ({
-        url: r.url || "",
-        method: r.method || "GET",
-        status: r.status || 0,
-        type: r.resourceType || r.type || "",
-        size: r.responseSize || r.size || 0,
-        duration: r.duration || 0,
+      requests: filtered.slice(0, 50).map((r) => ({
+        url: r.url,
+        method: r.method,
+        status: r.status,
+        type: "fetch",
+        size: 0,
+        duration: 0,
       })),
     },
   };
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
 }

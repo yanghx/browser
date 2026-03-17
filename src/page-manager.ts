@@ -85,29 +85,27 @@ async function ensureDomainTabImpl(
   const targetUrl = opts?.url ?? `https://${domain}`;
   const newResult = await chrome.callTool("new_page", { url: targetUrl });
 
-  const newText = extractText(newResult);
-  const newParsed = extractJson(newText);
+  // new_page returns the full pages list — parse it to find the new tab
+  const allPages = parsePagesResponse(newResult);
 
-  // new_page returns { pages: [...] } with ALL open pages
-  const allPages: any[] = newParsed?.pages || [];
-  const newlyCreated = allPages.find((p: any) => p.selected);
-  const newPageId: number | undefined = newlyCreated?.id;
+  // The newly created tab has the highest id
+  const matchingTabs = allPages.filter((p) => matchDomain(p.url, domain));
+  const newPageId = matchingTabs.length > 0
+    ? Math.max(...matchingTabs.map((p) => p.id))
+    : allPages.length > 0 ? allPages[allPages.length - 1].id : undefined;
 
-  // Check if an OLDER tab already had this domain (list_pages may have missed it)
-  const existingMatch = allPages.find(
-    (p: any) => p.id !== newPageId && matchDomain(p.url || "", domain),
-  );
-
-  if (existingMatch) {
-    // Found a pre-existing tab — use it and close the one we just created
-    log(`found pre-existing tab after new_page: pageId=${existingMatch.id}, closing new pageId=${newPageId}`);
-    domainPages.set(domain, existingMatch.id);
-    await chrome.callTool("select_page", { pageId: existingMatch.id });
-    if (newPageId !== undefined) {
+  // Check if an OLDER tab already had this domain before we created a new one
+  if (matchingTabs.length > 1 && newPageId !== undefined) {
+    // Keep the oldest matching tab, close the newly created one
+    const existingMatch = matchingTabs.find((p) => p.id !== newPageId);
+    if (existingMatch) {
+      log(`found pre-existing tab: pageId=${existingMatch.id}, closing new pageId=${newPageId}`);
+      domainPages.set(domain, existingMatch.id);
+      await chrome.callTool("select_page", { pageId: existingMatch.id });
       try { await chrome.callTool("close_page", { pageId: newPageId }); } catch {}
+      state.invalidateCache();
+      return;
     }
-    state.invalidateCache();
-    return;
   }
 
   // No pre-existing match — keep the newly created tab
@@ -129,19 +127,38 @@ interface TabInfo {
   title: string;
 }
 
+/** Parse Chrome DevTools MCP pages text: "N: URL [selected]" — also handles JSON fallback. */
+export function parsePagesText(text: string): TabInfo[] {
+  // Try JSON first
+  const parsed = extractJson(text);
+  if (parsed) {
+    const raw: any[] = Array.isArray(parsed) ? parsed : parsed?.pages || [];
+    return raw
+      .map((t: any) => ({
+        id: t.id ?? t.pageId ?? -1,
+        url: t.url || "",
+        title: t.title || "",
+      }))
+      .filter((t) => t.id >= 0);
+  }
+
+  // Parse text format: "1: https://www.v2ex.com/ [selected]"
+  const tabs: TabInfo[] = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^(\d+):\s+(\S+)(.*)$/);
+    if (!m) continue;
+    const id = parseInt(m[1]);
+    const url = m[2];
+    const rest = m[3]?.trim() || "";
+    const title = rest.replace(/\[selected\]/i, "").trim();
+    tabs.push({ id, url, title });
+  }
+  return tabs;
+}
+
 function parsePagesResponse(result: any): TabInfo[] {
   if (result?.isError) return [];
-  const text = extractText(result);
-  const parsed = extractJson(text);
-  if (!parsed) return [];
-  const raw: any[] = Array.isArray(parsed) ? parsed : parsed?.pages || [];
-  return raw
-    .map((t: any) => ({
-      id: t.id ?? t.pageId ?? -1,
-      url: t.url || "",
-      title: t.title || "",
-    }))
-    .filter((t) => t.id >= 0);
+  return parsePagesText(extractText(result));
 }
 
 async function listTabs(chrome: ChromeClientInterface): Promise<TabInfo[]> {
